@@ -75,12 +75,16 @@ async def run_shell(
             limit = int(getattr(settings, "cmd_timeout", 0) or 0)
     t0 = time.monotonic()
     env = None
-    if extra_env or project_id:
+    strict_external = bool(getattr(getattr(guard, "scope", None), "strict_external", False))
+    if extra_env or project_id or strict_external:
         from ..objective import objective_allows_flag
         if extra_env and objective_allows_flag(getattr(guard, "objective", None)):
             extra_env = None
-    if extra_env or project_id:
+    if extra_env or project_id or strict_external:
         env = os.environ.copy()
+        if strict_external:
+            for k in _PROXY_ENV_KEYS:
+                env.pop(k, None)
         if extra_env:
             env.update(extra_env)
         if project_id:

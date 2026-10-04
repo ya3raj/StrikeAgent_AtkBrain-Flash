@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 
 from fastapi import APIRouter, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse
@@ -28,6 +30,7 @@ from ..projects import (
     list_projects,
     rename_project,
     update_config,
+    strict_external_policy_error,
 )
 from ..report import generator as report_gen
 from ..report import claude_export as report_export
@@ -125,6 +128,7 @@ class CreateProjectReq(BaseModel):
     auth_password: str | None = None
     auth_token: str | None = None        # Bearer / JWT / API key / Cookie 原文
     output_lang: str | None = None       # zh | en；猎面人可见输出语言
+    strict_external_scope: bool = False  # opt-in exact host+port application boundary
 
 
 class OutputLangReq(BaseModel):
@@ -547,6 +551,14 @@ async def api_create_project(req: CreateProjectReq):
     }
     if req.model:
         cfg["model"] = req.model
+    if req.strict_external_scope:
+        if req.kind != "single" or track not in ("redteam", "src"):
+            raise HTTPException(
+                400,
+                "strict_external_scope 仅支持 single redteam/src 项目",
+            )
+        if req.allow_subdomains:
+            raise HTTPException(400, "strict_external_scope 禁止 allow_subdomains")
     if track in ("redteam", "src"):
         from ..agents.brief_creds import normalize_supplied_auth
         supplied = normalize_supplied_auth({
@@ -591,12 +603,65 @@ async def api_create_project(req: CreateProjectReq):
             proj = await create_single_project(
                 req.name, req.target, req.ports,
                 allow_subdomains=False, mode=req.mode, config=cfg,
+                strict_external_scope=req.strict_external_scope,
             )
         else:
             raise HTTPException(400, "kind 仅支持 single|cluster|benchmark")
     except ValueError as e:
         raise HTTPException(400, str(e)) from e
     return proj
+
+
+@router.get("/federation/projects/{pid}/policy-attestation")
+async def api_federation_policy_attestation(pid: str):
+    """Return a stable, non-secret statement of the native enforcement mode."""
+    p = await get_project(pid)
+    if not p:
+        raise HTTPException(404, msg("project_missing"))
+    scope = p.get("scope") or {}
+    mode = str(scope.get("mode") or "strict")
+    enforced = mode == "strict-external"
+    policy = {
+        "schema": "atkbrain.strict-external-policy.v1",
+        "project_id": pid,
+        "mode": mode,
+        "enforced": enforced,
+        "application_boundary": enforced,
+        "os_egress_enforced": False,
+        "targets": sorted(str(x) for x in (scope.get("targets") or [])),
+        "ports": sorted(int(x) for x in (scope.get("ports") or [])),
+        "dns_pins": {
+            str(k): sorted(str(x) for x in (v or []))
+            for k, v in sorted((scope.get("dns_pins") or {}).items())
+        },
+        "allow_subdomains": bool(scope.get("allow_subdomains")),
+        "scope_expansion": not enforced,
+        "redirect_policy": "reject" if enforced else "native",
+        "command_policy": (
+            "single-literal-command; allowlisted-local-tools-or-recognized-connectors; "
+            "exact-host-port"
+            if enforced else "native"
+        ),
+    }
+    # The digest binds the complete static policy identity, including the
+    # project id and DNS pins.  Lifecycle is intentionally excluded because it
+    # changes while the project runs.
+    digest_fields = dict(policy)
+    policy["policy_digest"] = "sha256:" + hashlib.sha256(
+        json.dumps(
+            digest_fields, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+        ).encode("utf-8")
+    ).hexdigest()
+    h = manager.get(pid)
+    running = manager.is_running(pid)
+    queued = manager.is_queued(pid)
+    policy["lifecycle"] = {
+        "status": displayed_status(p.get("status"), running=running, queued=queued),
+        "running": running,
+        "queued": queued,
+        "run_id": h.run_id if h else None,
+    }
+    return policy
 
 
 @router.post("/projects/assets/preview")
@@ -729,6 +794,9 @@ async def api_start(pid: str, confirm_restart: bool = Query(False)):
         raise HTTPException(404, msg("project_missing"))
     if p["kind"] in ("cluster", "benchmark"):
         raise HTTPException(400, "父项目不直接运行；请对其子项目单独或批量启动。")
+    strict_error = await strict_external_policy_error(p)
+    if strict_error:
+        raise HTTPException(409, strict_error)
     await _require_llm_key_for(pid)
     refuse = await bmk.gate_start_against_closed_env(p)
     if refuse:

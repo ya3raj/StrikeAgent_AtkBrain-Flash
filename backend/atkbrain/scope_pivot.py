@@ -163,6 +163,9 @@ def merge_scope_keep_pivots(
     stale_entry_hosts: set[str] | None = None,
     reject_hosts: set[str] | None = None,
 ) -> Scope:
+    if new.strict_external or old.strict_external:
+        # Exact external projects never inherit graph-derived/pivot identities.
+        return new
     stale = {_norm_host(h) for h in (stale_entry_hosts or ()) if h}
     reject = {_norm_host(h) for h in (reject_hosts or ()) if h}
     new_entry = {_norm_host(t) for t in (new.targets or [])}
@@ -332,7 +335,7 @@ async def hydrate_scope_from_graph(
 ) -> bool:
     from .db import db as _db
 
-    if not project_id:
+    if not project_id or scope.strict_external:
         return False
     rows = await _db.fetchall(
         """SELECT key, type, tags FROM nodes WHERE project_id=? AND (
@@ -383,6 +386,9 @@ async def try_expand_scope(
     src = _norm_host(from_host)
     dst = _norm_host(to_host)
     result = {"expanded": False, "reason": ""}
+    if scope.strict_external:
+        result["reason"] = "strict_external_scope_no_expansion"
+        return result
     if not dst:
         result["reason"] = "empty_target"
         return result

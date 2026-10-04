@@ -22,7 +22,9 @@ from ..graph.hypothesize import (
 )
 from ..graph.model import NodeIn
 from ..memory import store as memory
-from ..projects import build_scope, get_project, update_config, update_status
+from ..projects import (
+    build_scope, get_project, strict_external_policy_error, update_config, update_status,
+)
 from ..project_status import (
     ctf_pass_index,
     final_project_status,
@@ -1044,6 +1046,18 @@ async def run_project_loop(manager: RunManager, project_id: str) -> None:
     from .scheduler import hunt_slot_kind
 
     is_benchmark = bmk.is_benchmark_sub(project)
+
+    strict_error = await strict_external_policy_error(project)
+    if strict_error:
+        handle.status = "done"
+        manager._drop_handle(project_id, handle)
+        await update_status(project_id, "error")
+        await emit(project_id, "log", {"level": "error", "message": strict_error})
+        await emit(
+            project_id, "status",
+            {"status": "error", "reason": "strict_external_policy"},
+        )
+        return
 
     if is_benchmark:
         refuse = await bmk.gate_start_against_closed_env(project)
