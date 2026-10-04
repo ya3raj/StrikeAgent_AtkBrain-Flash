@@ -39,16 +39,16 @@ jobs:
             --unit=ultrahackbot-egress-proof \
             --property=IPAddressDeny=any \
             --property=IPAddressAllow=localhost \
-            python3 - <<'PY'
-          import errno
-          import socket
-
+            /usr/bin/python3 -c '
+          import errno, socket
           def result(address):
               with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as stream:
                   stream.settimeout(2)
                   return stream.connect_ex(address)
-
           denied = {errno.EACCES, errno.EPERM}
-          assert result(("127.0.0.1", 1)) not in denied
-          assert result(("1.1.1.1", 443)) in denied
-          PY
+          local_result = result(("127.0.0.1", 1))
+          external_result = result(("1.1.1.1", 443))
+          print({"localhost": local_result, "undeclared": external_result})
+          assert local_result not in denied
+          assert external_result in denied
+          '
