@@ -44,6 +44,8 @@ from ..report.poc import poc_for_finding
 from .. import cluster as cluster_mod
 from .. import benchmark as bmk
 from ..agents.mcp_http import router as mcp_router
+from ..exec.egress import kernel_egress_error
+from ..scope import Scope
 
 
 def _project_http_target(p: dict | None) -> str:
@@ -621,13 +623,14 @@ async def api_federation_policy_attestation(pid: str):
     scope = p.get("scope") or {}
     mode = str(scope.get("mode") or "strict")
     enforced = mode == "strict-external"
+    os_egress_enforced = enforced and kernel_egress_error(Scope.from_dict(scope)) is None
     policy = {
         "schema": "atkbrain.strict-external-policy.v1",
         "project_id": pid,
         "mode": mode,
         "enforced": enforced,
         "application_boundary": enforced,
-        "os_egress_enforced": False,
+        "os_egress_enforced": os_egress_enforced,
         "targets": sorted(str(x) for x in (scope.get("targets") or [])),
         "ports": sorted(int(x) for x in (scope.get("ports") or [])),
         "dns_pins": {
