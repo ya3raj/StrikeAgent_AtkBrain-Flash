@@ -9,6 +9,7 @@ import ipaddress
 from .db import db, new_id, now, _dumps, _loads
 from .objective import FLAG, REDTEAM, SRC, normalize_objective
 from .scope import Scope, canonical_host, forbidden_project_target_reason, is_loopback, is_private
+from .exec.egress import kernel_egress_error
 
 _IP_RE = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
 
@@ -524,4 +525,7 @@ async def strict_external_policy_error(project: dict | None) -> str | None:
     unexpected = sorted(current - pins)
     if unexpected:
         return f"strict-external DNS pin mismatch: unexpected {unexpected}"
+    egress_error = kernel_egress_error(scope)
+    if egress_error:
+        return egress_error
     return None
