@@ -5,6 +5,9 @@ from dataclasses import dataclass, field
 from urllib.parse import urlparse
 
 import httpx
+import asyncio
+import ipaddress
+import socket
 
 from ..config import settings
 from ..exec.guard import Guard
@@ -88,9 +91,17 @@ class AgentContext:
         why = sensitive_attack_reason(host)
         if why:
             return why
-        port = parsed.port
+        try:
+            port = parsed.port
+        except ValueError:
+            return "invalid URL port"
         if not port:
             port = 443 if parsed.scheme == "https" else 80
+        if self.scope.strict_external:
+            if parsed.scheme.lower() not in ("http", "https"):
+                return "strict-external only admits HTTP(S) URLs"
+            if not self.scope.exact_endpoint_in_scope(host, port):
+                return f"strict-external endpoint {host}:{port} is outside exact scope"
         self_hosts = getattr(self.guard, "self_hosts", None) or local_self_hosts()
         self_ports = getattr(self.guard, "self_ports", None) or {
             int(settings.port), int(settings.frontend_port),
@@ -164,6 +175,40 @@ class AgentContext:
             return f"越界：{why}。只打作业对象注册域，不要改打同品牌其它域。"
         return None
 
+    async def _strict_dns_blocked(self, host: str) -> str | None:
+        """Fail closed if a hostname no longer resolves inside its creation-time pins."""
+        if not self.scope.strict_external:
+            return None
+        h = canonical_host(host)
+        try:
+            ipaddress.ip_address(h)
+            return None
+        except ValueError:
+            pass
+        pins = {
+            canonical_host(x)
+            for x in (self.scope.dns_pins or {}).get(h, [])
+            if x
+        }
+        if not pins:
+            return f"strict-external has no DNS pins for {h}"
+        try:
+            infos = await asyncio.to_thread(socket.getaddrinfo, h, None)
+        except Exception:
+            return f"strict-external could not revalidate DNS for {h}"
+        current: set[str] = set()
+        for info in infos:
+            try:
+                current.add(str(ipaddress.ip_address(info[4][0])))
+            except (ValueError, IndexError, TypeError):
+                continue
+        if not current:
+            return f"strict-external DNS revalidation returned no addresses for {h}"
+        unexpected = sorted(current - pins)
+        if unexpected:
+            return f"strict-external DNS pin mismatch for {h}: unexpected {unexpected}"
+        return None
+
     async def _host_is_ssrf_gateway(self, host: str) -> bool:
         h = (host or "").strip().lower().split(":")[0]
         if not h:
@@ -221,7 +266,10 @@ class AgentContext:
             must = False
             try:
                 from ..proxy.pool import pool as _proxy_pool
-                must = _proxy_pool.must_proxy(self.objective)
+                must = (
+                    False if self.scope.strict_external
+                    else _proxy_pool.must_proxy(self.objective)
+                )
                 if must:
                     px = await _proxy_pool.wait_pick(8.0, prefer_http=True)
                     extra_env = _proxy_pool.proxy_env(px)
@@ -243,9 +291,12 @@ class AgentContext:
     def _client(self) -> httpx.AsyncClient:
         if self._httpx_cli is None:
             self._httpx_cli = httpx.AsyncClient(
-                follow_redirects=True,
+                follow_redirects=not self.scope.strict_external,
                 timeout=_HTTP_TIMEOUT,
-                verify=False,
+                # Preserve the legacy behavior outside strict mode, but never
+                # weaken TLS verification for the attested federation path.
+                verify=self.scope.strict_external,
+                trust_env=False,
             )
         return self._httpx_cli  # type: ignore[return-value]
 
@@ -271,6 +322,10 @@ class AgentContext:
                 must = _proxy_pool.must_proxy(self.objective)
             except Exception:
                 must = False
+        if self.scope.strict_external:
+            # A proxy is itself an additional network endpoint and may resolve
+            # the target remotely, so strict mode always uses the direct client.
+            return await self._client().request(method, url, headers=headers, content=content)
         if not must:
             return await self._client().request(method, url, headers=headers, content=content)
 
@@ -325,6 +380,10 @@ class AgentContext:
         if blocked:
             return {"blocked": True, "error": blocked, "status": 0}
         host = self.host_of(url)
+        if self.scope.strict_external:
+            dns_blocked = await self._strict_dns_blocked(host)
+            if dns_blocked:
+                return {"blocked": True, "error": dns_blocked, "status": 0}
         if host and await self._host_is_ssrf_gateway(host):
             return {
                 "error": (
@@ -337,6 +396,18 @@ class AgentContext:
                 "status": 0,
             }
         hdrs = dict(headers or {})
+        if self.scope.strict_external:
+            for key, value in hdrs.items():
+                if str(key).strip().lower() != "host":
+                    continue
+                wanted = canonical_host(host)
+                supplied = canonical_host(str(value).split(":", 1)[0])
+                if supplied != wanted:
+                    return {
+                        "blocked": True,
+                        "error": f"strict-external rejects Host override {supplied}",
+                        "status": 0,
+                    }
         if self._cookies:
             cookie = "; ".join(f"{k}={v}" for k, v in self._cookies.items())
             if cookie:
@@ -345,6 +416,18 @@ class AgentContext:
             resp = await self._request_http(method.upper(), url, headers=hdrs, content=data)
         except Exception as e:
             return {"error": str(e), "status": 0, "engine": "httpx"}
+        if self.scope.strict_external and 300 <= int(resp.status_code) < 400:
+            return {
+                "blocked": True,
+                "error": "strict-external rejected redirect response",
+                "status": int(resp.status_code),
+                "headers": {
+                    k: v for k, v in resp.headers.items()
+                    if k.lower() in ("location", "content-type")
+                },
+                "final_url": str(resp.url),
+                "engine": "httpx",
+            }
         for k, v in resp.cookies.items():
             self._cookies[str(k)] = str(v)
         body = ""

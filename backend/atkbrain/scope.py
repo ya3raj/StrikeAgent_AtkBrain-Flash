@@ -1043,6 +1043,29 @@ class Scope:
     ports: list[int] | None = None
     allow_subdomains: bool = False
     mode: str = "strict"
+    dns_pins: dict[str, list[str]] = field(default_factory=dict)
+
+    @property
+    def strict_external(self) -> bool:
+        """Whether this scope uses the opt-in, non-expanding external policy."""
+        return self.mode == "strict-external"
+
+    def exact_endpoint_in_scope(self, host: str, port: int | None) -> bool:
+        """Match one literal authorized host and one explicit authorized port.
+
+        This intentionally does not accept resolved IP aliases, subdomains,
+        registrable-domain siblings, infrastructure exceptions, or pivots.
+        """
+        if not self.strict_external or port is None:
+            return False
+        h = canonical_host(host)
+        targets = {canonical_host(t) for t in self.targets if t}
+        try:
+            p = int(port)
+        except (TypeError, ValueError):
+            return False
+        allowed_ports = {int(x) for x in (self.ports or []) if isinstance(x, int)}
+        return h in targets and p in allowed_ports
 
     def identity_hosts(self) -> set[str]:
         out: set[str] = set()
@@ -1065,6 +1088,10 @@ class Scope:
             return False
         if is_attacker_identity(h):
             return False
+        if self.strict_external:
+            return canonical_host(h) in {
+                canonical_host(t) for t in self.targets if t
+            }
         if h in INFRA_ALLOWLIST:
             return True
         if self._explicit_member(h):
@@ -1090,6 +1117,10 @@ class Scope:
             "ports": self.ports,
             "allow_subdomains": self.allow_subdomains,
             "mode": self.mode,
+            "dns_pins": {
+                str(k): sorted({str(x) for x in (v or []) if x})
+                for k, v in sorted((self.dns_pins or {}).items())
+            },
         }
 
     @classmethod
@@ -1102,4 +1133,9 @@ class Scope:
             ports=d.get("ports"),
             allow_subdomains=bool(d.get("allow_subdomains")),
             mode=str(d.get("mode") or "strict"),
+            dns_pins={
+                str(k): [str(x) for x in (v or []) if x]
+                for k, v in (d.get("dns_pins") or {}).items()
+                if isinstance(v, (list, tuple, set))
+            },
         )

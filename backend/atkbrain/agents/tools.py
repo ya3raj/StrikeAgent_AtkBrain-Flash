@@ -1523,6 +1523,11 @@ def build_atkbrain_tools(ctx: AgentContext) -> list:
         },
     )
     async def report_pivot_capability(args: dict) -> dict:
+        if ctx.scope.strict_external:
+            return _text(
+                "⛔ strict-external 项目绑定精确目标与端口，禁止 pivot/scope expansion。",
+                is_error=True,
+            )
         from_host = _norm_host(args.get("from_host") or "")
         to_host = _norm_host(args.get("to_host_or_ip") or "")
         mechanism = (args.get("mechanism") or "").strip().lower()

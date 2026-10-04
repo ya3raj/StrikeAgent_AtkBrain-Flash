@@ -4,10 +4,11 @@ from __future__ import annotations
 import asyncio
 import re
 import socket
+import ipaddress
 
 from .db import db, new_id, now, _dumps, _loads
 from .objective import FLAG, REDTEAM, SRC, normalize_objective
-from .scope import Scope, forbidden_project_target_reason, is_loopback, is_private
+from .scope import Scope, canonical_host, forbidden_project_target_reason, is_loopback, is_private
 
 _IP_RE = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
 
@@ -55,6 +56,25 @@ async def _resolve(host: str) -> set[str]:
         return set()
 
 
+async def _resolve_all(host: str) -> set[str]:
+    """Resolve and canonicalize every address used as a strict DNS pin."""
+    try:
+        return {str(ipaddress.ip_address(host))}
+    except ValueError:
+        pass
+    try:
+        infos = await asyncio.to_thread(socket.getaddrinfo, host, None)
+    except Exception:
+        return set()
+    out: set[str] = set()
+    for info in infos:
+        try:
+            out.add(str(ipaddress.ip_address(info[4][0])))
+        except (ValueError, IndexError, TypeError):
+            continue
+    return out
+
+
 def _filter_scope_ips(host: str, ips: set[str], objective: str | None) -> tuple[set[str], str | None]:
     """创建期 DNS 去漂移：域名解析结果剔除回环；红队额外剔除私网。显式 IP 目标原样保留。"""
     if _IP_RE.match(host):
@@ -85,6 +105,7 @@ async def create_single_project(
     parent_id: str | None = None,
     extra_targets: list[str] | None = None,
     extra_ips: set[str] | None = None,
+    strict_external_scope: bool = False,
 ) -> dict:
     host, inline_port = _clean_target(target)
     assert_safe_project_target(host)
@@ -101,6 +122,54 @@ async def create_single_project(
         extra.append(h)
     all_targets = [host, *extra]
     cfg = dict(config or {})
+    if strict_external_scope:
+        if extra:
+            raise ValueError("strict_external_scope 仅支持一个精确目标")
+        if allow_subdomains:
+            raise ValueError("strict_external_scope 禁止 allow_subdomains")
+        normalized_ports: list[int] = []
+        for raw in ports or []:
+            try:
+                p = int(raw)
+            except (TypeError, ValueError):
+                raise ValueError("strict_external_scope 端口必须为整数") from None
+            if not 1 <= p <= 65535:
+                raise ValueError("strict_external_scope 端口必须在 1..65535")
+            if p not in normalized_ports:
+                normalized_ports.append(p)
+        if not normalized_ports:
+            raise ValueError("strict_external_scope 必须提供至少一个精确端口")
+        ports = sorted(normalized_ports)
+        pinned = await _resolve_all(host)
+        if not pinned:
+            raise ValueError("strict_external_scope 目标必须能在创建时解析")
+        unsafe = sorted(
+            ip for ip in pinned
+            if not ipaddress.ip_address(ip).is_global
+        )
+        if unsafe:
+            raise ValueError(
+                f"strict_external_scope 仅允许公网目标；解析到非公网地址：{unsafe}"
+            )
+        cfg["strict_external_scope"] = True
+        scope = Scope(
+            targets=[canonical_host(host)],
+            ips=[],
+            ports=ports,
+            allow_subdomains=False,
+            mode="strict-external",
+            dns_pins={canonical_host(host): sorted(pinned)},
+        )
+        pid = new_id("p_")
+        ts = now()
+        cfg["vhosts"] = [canonical_host(host)]
+        await db.execute(
+            """INSERT INTO projects(id, name, kind, target, ports, scope, config, status, parent_id, created_at, updated_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+            (pid, name or host, "single", canonical_host(host), _dumps(ports),
+             _dumps(scope.to_dict()), _dumps(cfg), "idle", parent_id, ts, ts),
+        )
+        return await get_project(pid)
     ips_raw = await _resolve(host)
     for h in extra:
         ips_raw |= await _resolve(h)
@@ -407,3 +476,52 @@ async def delete_projects(ids: list[str]) -> dict:
 
 def build_scope(project: dict) -> Scope:
     return Scope.from_dict(project.get("scope"))
+
+
+async def strict_external_policy_error(project: dict | None) -> str | None:
+    """Validate stored strict policy and creation-time DNS pins before a run."""
+    if not isinstance(project, dict):
+        return "project missing"
+    cfg = project.get("config") or {}
+    scope = Scope.from_dict(project.get("scope") or {})
+    marked = bool(cfg.get("strict_external_scope")) or scope.strict_external
+    if not marked:
+        return None
+    if not bool(cfg.get("strict_external_scope")) or not scope.strict_external:
+        return "strict-external config/scope marker mismatch"
+    if project.get("kind") != "single":
+        return "strict-external requires a single project"
+    if scope.allow_subdomains or scope.cidrs or scope.ips:
+        return "strict-external forbids subdomains, CIDRs, and mutable IP aliases"
+    targets = [canonical_host(x) for x in scope.targets if x]
+    target = canonical_host(str(project.get("target") or ""))
+    if len(targets) != 1 or targets[0] != target:
+        return "strict-external target binding mismatch"
+    try:
+        scope_ports = sorted({int(x) for x in (scope.ports or [])})
+        project_ports = sorted({int(x) for x in (project.get("ports") or [])})
+    except (TypeError, ValueError):
+        return "strict-external contains an invalid port"
+    if not scope_ports or scope_ports != project_ports:
+        return "strict-external port binding mismatch"
+    if any(not 1 <= p <= 65535 for p in scope_ports):
+        return "strict-external port out of range"
+    pins = {
+        canonical_host(x)
+        for x in (scope.dns_pins or {}).get(target, [])
+        if x
+    }
+    if not pins:
+        return "strict-external DNS pins missing"
+    try:
+        if any(not ipaddress.ip_address(x).is_global for x in pins):
+            return "strict-external DNS pins contain a non-public address"
+    except ValueError:
+        return "strict-external DNS pins contain an invalid address"
+    current = {canonical_host(x) for x in await _resolve_all(target)}
+    if not current:
+        return "strict-external DNS revalidation returned no addresses"
+    unexpected = sorted(current - pins)
+    if unexpected:
+        return f"strict-external DNS pin mismatch: unexpected {unexpected}"
+    return None

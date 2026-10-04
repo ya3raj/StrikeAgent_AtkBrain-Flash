@@ -5,6 +5,7 @@ import ipaddress
 import os
 import re
 import shlex
+from urllib.parse import urlsplit
 from dataclasses import dataclass
 
 from ..config import settings
@@ -493,6 +494,133 @@ _ALT_HOSTPORT_RE = re.compile(
     re.I,
 )
 
+_STRICT_LOCAL_PROGS = frozenset({
+    "base64", "basename", "cat", "cut", "date", "dirname", "echo", "false",
+    "file", "head", "id", "jq", "ls", "md5sum", "printf", "pwd", "readlink",
+    "realpath", "rg", "sha256sum", "sort", "stat", "strings", "tail", "test",
+    "tr", "true", "uname", "uniq", "wc", "xxd",
+})
+_STRICT_DEFAULT_PORTS = {
+    "curl": 80, "wget": 80, "http": 80, "https": 443,
+    "ssh": 22, "scp": 22, "sftp": 22, "ftp": 21, "lftp": 21,
+    "redis-cli": 6379, "mysql": 3306, "psql": 5432, "mongo": 27017,
+    "smbclient": 445, "rpcclient": 445, "smbmap": 445,
+    "nxc": 445, "crackmapexec": 445,
+}
+_STRICT_SHELL_META_RE = re.compile(r"(?:&&|\|\||[;&|`$<>]|[\r\n])")
+_STRICT_UNSAFE_CONNECT_FLAGS = frozenset({
+    "-k", "--insecure", "-l", "--location", "--location-trusted",
+    "-x", "--proxy", "--preproxy", "--noproxy", "--resolve",
+    "--connect-to", "--unix-socket", "--abstract-unix-socket",
+    "--socks4", "--socks4a", "--socks5", "--socks5-hostname",
+})
+
+
+def _strict_url_port(command: str, host: str) -> int | None:
+    """Infer only standard ports that are unambiguous in a literal URL token."""
+    wanted = canonical_host(host)
+    for tok in _safe_split(command):
+        raw = tok.strip("'\"")
+        if "://" not in raw:
+            continue
+        try:
+            parsed = urlsplit(raw)
+            if canonical_host(parsed.hostname or "") != wanted:
+                continue
+            if parsed.port is not None:
+                return int(parsed.port)
+            if parsed.scheme.lower() in ("https", "wss"):
+                return 443
+            if parsed.scheme.lower() in ("http", "ws"):
+                return 80
+            if parsed.scheme.lower() in ("ftp", "ftps"):
+                return 21 if parsed.scheme.lower() == "ftp" else 990
+            if parsed.scheme.lower() in ("ssh", "sftp"):
+                return 22
+        except (ValueError, TypeError):
+            return None
+    return None
+
+
+def strict_external_command_reason(
+    command: str,
+    scope: Scope,
+    *,
+    pairs: list[tuple[str, int | None]] | None = None,
+    cidrs: list[ipaddress.IPv4Network] | None = None,
+) -> str | None:
+    """Application-level command boundary for the opt-in external mode.
+
+    It admits a deliberately small set of non-network utilities or one known
+    connector with literal, parseable exact endpoints.  It is not an OS egress
+    sandbox; the attestation reports that limitation explicitly.
+    """
+    if not scope.strict_external:
+        return None
+    cmd = (command or "").strip()
+    if not cmd:
+        return "strict-external requires a non-empty command"
+    if _STRICT_SHELL_META_RE.search(cmd):
+        return "strict-external rejects shell composition, expansion, redirection, and backgrounding"
+    tokens = _safe_split(cmd)
+    if not tokens:
+        return "strict-external could not parse the command"
+    first = tokens[0].rsplit("/", 1)[-1].lower()
+    if first in (_WRAPPERS - {"timeout"}):
+        return f"strict-external rejects command wrapper {first}"
+    prog = _leading_prog(tokens).lower()
+    pairs = list(pairs or [])
+    cidrs = list(cidrs or [])
+    if prog in _STRICT_LOCAL_PROGS:
+        if pairs or cidrs:
+            return "strict-external local utility unexpectedly contains a network target"
+        return None
+    if prog not in _CONNECT_PROGS:
+        return f"strict-external does not attest executable {prog or '(unknown)'}"
+    lowered_tokens = {tok.lower().split("=", 1)[0] for tok in tokens[1:]}
+    unsafe_flags = sorted(lowered_tokens & _STRICT_UNSAFE_CONNECT_FLAGS)
+    if unsafe_flags:
+        return f"strict-external rejects connector option {unsafe_flags[0]}"
+    if cidrs:
+        return "strict-external rejects CIDR/range scans; authorize literal endpoints only"
+    if not pairs:
+        return "strict-external connector requires a literal target and explicit/inferable port"
+
+    # A custom Host header can select a different virtual tenant on the same IP.
+    for i, tok in enumerate(tokens):
+        val = ""
+        if tok in ("-H", "--header") and i + 1 < len(tokens):
+            val = tokens[i + 1]
+        elif tok.startswith("--header="):
+            val = tok.split("=", 1)[1]
+        if val.lower().startswith("host:"):
+            vhost = canonical_host(val.split(":", 1)[1].strip().split(":", 1)[0])
+            if vhost not in {canonical_host(t) for t in scope.targets if t}:
+                return f"strict-external rejects Host override {vhost}"
+
+    for host, raw_port in pairs:
+        # Shell connectors use the operating-system resolver after this guard
+        # returns, so a hostname would leave a DNS-rebinding race.  Hostname
+        # requests remain available through AgentContext's revalidated native
+        # HTTP client; shell connectors are admitted only for literal IPs.
+        try:
+            ipaddress.ip_address(canonical_host(host))
+        except ValueError:
+            return (
+                "strict-external shell connectors require a literal IP; "
+                "use the native HTTP request tool for hostname targets"
+            )
+        port = raw_port
+        if port is None:
+            port = _strict_url_port(cmd, host)
+        if port is None:
+            port = _STRICT_DEFAULT_PORTS.get(prog)
+        if port is None:
+            return f"strict-external requires an explicit port for {host}"
+        if not scope.exact_endpoint_in_scope(host, port):
+            return f"strict-external endpoint {canonical_host(host)}:{port} is outside exact scope"
+    return None
+
 
 def _connect_token_hostport(tok: str) -> tuple[str | None, int | None]:
     """直连参数上的主机（含十进制/短写 IPv4），不含 -d 载荷。"""
@@ -846,6 +974,17 @@ class Guard:
                 (h, p if p is not None else extra_ports[0])
                 for h, p in pairs
             ]
+
+        strict_why = strict_external_command_reason(
+            cmd, self.scope, pairs=pairs, cidrs=direct_cidrs,
+        )
+        if strict_why:
+            return GuardDecision(
+                False,
+                f"blocked by strict-external policy: {strict_why}",
+                "out_of_scope",
+                hosts=sorted(direct_hosts),
+            )
 
         primary = ""
         try:
