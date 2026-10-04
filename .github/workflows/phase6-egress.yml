@@ -1,0 +1,53 @@
+name: Phase 6 egress
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  backend-contract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+      - name: Install backend and test dependencies
+        run: python -m pip install -r backend/requirements.txt pytest
+      - name: Run backend contract suite
+        env:
+          PYTHONPATH: backend
+        run: python -m pytest -q backend/atkbrain
+
+  systemd-egress-proof:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prove the external canary is reachable without the policy
+        run: /usr/bin/python3 scripts/verify-systemd-egress.py --baseline
+      - name: Prove localhost allowed and undeclared Internet denied
+        run: |
+          set +e
+          proof="$(sudo systemd-run --quiet --wait --pipe \
+            --unit=ultrahackbot-egress-proof \
+            --property=IPAddressDeny=any \
+            --property=IPAddressAllow=localhost \
+            /usr/bin/python3 "$GITHUB_WORKSPACE/scripts/verify-systemd-egress.py" 2>&1)"
+          status=$?
+          set -e
+          echo "$proof"
+          if [ "$status" -ne 0 ]; then
+            proof="${proof//$'\n'/' | '}"
+            echo "::error title=systemd egress proof failed::$proof"
+            exit "$status"
+          fi
