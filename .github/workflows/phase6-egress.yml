@@ -1,0 +1,54 @@
+name: Phase 6 egress
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  backend-contract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+      - name: Install backend and test dependencies
+        run: python -m pip install -r backend/requirements.txt pytest
+      - name: Run backend contract suite
+        env:
+          PYTHONPATH: backend
+        run: python -m pytest -q backend/atkbrain
+
+  systemd-egress-proof:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prove localhost allowed and undeclared Internet denied
+        run: |
+          sudo systemd-run --quiet --wait --pipe \
+            --unit=ultrahackbot-egress-proof \
+            --property=IPAddressDeny=any \
+            --property=IPAddressAllow=localhost \
+            python3 - <<'PY'
+          import errno
+          import socket
+
+          def result(address):
+              with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as stream:
+                  stream.settimeout(2)
+                  return stream.connect_ex(address)
+
+          denied = {errno.EACCES, errno.EPERM}
+          assert result(("127.0.0.1", 1)) not in denied
+          assert result(("1.1.1.1", 443)) in denied
+          PY
