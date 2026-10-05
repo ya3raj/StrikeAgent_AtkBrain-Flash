@@ -130,13 +130,15 @@ export function LoginRipple() {
         }));
         track(animate(dots, {
           x: (_, i) => {
-            const m = motes[i];
-            const f = foci[i % foci.length];
+            const index = i ?? 0;
+            const m = motes[index];
+            const f = foci[index % foci.length];
             return ((f.x - m.x) / 100) * box.w * 0.55;
           },
           y: (_, i) => {
-            const m = motes[i];
-            const f = foci[i % foci.length];
+            const index = i ?? 0;
+            const m = motes[index];
+            const f = foci[index % foci.length];
             return ((f.y - m.y) / 100) * box.h * 0.55;
           },
           opacity: () => utils.random(0.1, 0.3, 2),
@@ -164,18 +166,20 @@ export function LoginRipple() {
         const cy = utils.random(28, 72, 2);
         track(animate(dots, {
           x: (_, i) => {
-            const ang = (i / dots.length) * Math.PI * 2;
-            const r = 28 + (i % 6) * 16;
-            const m = motes[i];
+            const index = i ?? 0;
+            const ang = (index / dots.length) * Math.PI * 2;
+            const r = 28 + (index % 6) * 16;
+            const m = motes[index];
             return ((cx - m.x) / 100) * box.w + Math.cos(ang) * r;
           },
           y: (_, i) => {
-            const ang = (i / dots.length) * Math.PI * 2;
-            const r = 22 + (i % 6) * 14;
-            const m = motes[i];
+            const index = i ?? 0;
+            const ang = (index / dots.length) * Math.PI * 2;
+            const r = 22 + (index % 6) * 14;
+            const m = motes[index];
             return ((cy - m.y) / 100) * box.h + Math.sin(ang) * r;
           },
-          opacity: (_, i) => (i % 4 === 0 ? 0.06 : utils.random(0.12, 0.3, 2)),
+          opacity: (_, i) => ((i ?? 0) % 4 === 0 ? 0.06 : utils.random(0.12, 0.3, 2)),
           duration: 2800,
           ease: "inOutSine",
           onComplete: () => {
@@ -200,7 +204,7 @@ export function LoginRipple() {
         const maxR = Math.min(box.w, box.h) * 0.46;
         track(animate(dots, {
           opacity: (_, i) => {
-            const m = motes[i];
+            const m = motes[i ?? 0];
             const d = Math.hypot((m.x / 100) * box.w - cx, (m.y / 100) * box.h - cy);
             return d < maxR * 0.75 ? utils.random(0.16, 0.3, 2) : 0.05;
           },
@@ -269,10 +273,10 @@ export function LoginRipple() {
         dots[i].style.color = utils.randomPick(["#cc785c", "#b88974", "#d9b6a6"]) as string;
       });
       track(animate(dots, {
-        opacity: (_, i) => (hot.has(i) ? utils.random(0.28, 0.42, 2) : 0.04),
-        scale: (_, i) => (hot.has(i) ? utils.random(1.4, 2.1, 2) : 0.55),
-        x: (_, i) => (hot.has(i) ? utils.random(-10, 10) : 0),
-        y: (_, i) => (hot.has(i) ? utils.random(-14, -2) : 0),
+        opacity: (_, i) => (hot.has(i ?? -1) ? utils.random(0.28, 0.42, 2) : 0.04),
+        scale: (_, i) => (hot.has(i ?? -1) ? utils.random(1.4, 2.1, 2) : 0.55),
+        x: (_, i) => (hot.has(i ?? -1) ? utils.random(-10, 10) : 0),
+        y: (_, i) => (hot.has(i ?? -1) ? utils.random(-14, -2) : 0),
         delay: stagger(40, { from: "random" }),
         duration: 2600,
         ease: "inOutSine",
