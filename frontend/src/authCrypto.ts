@@ -39,7 +39,11 @@ async function encryptWithSubtle(pem: string, data: Uint8Array): Promise<string>
     false,
     ["encrypt"],
   );
-  const cipher = await subtle.encrypt({ name: "RSA-OAEP" }, key, data);
+  // WebCrypto requires ArrayBuffer-backed bytes; the caller's typed array may
+  // be backed by SharedArrayBuffer under newer TypeScript DOM declarations.
+  const plain = new Uint8Array(data.byteLength);
+  plain.set(data);
+  const cipher = await subtle.encrypt({ name: "RSA-OAEP" }, key, plain);
   return bytesToB64(cipher);
 }
 

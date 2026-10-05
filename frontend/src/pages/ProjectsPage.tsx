@@ -67,7 +67,7 @@ export function ProjectsPage() {
     setBatchErr("");
     try {
       let result: { failed?: { id?: string; error?: string }[] } | undefined;
-      if (pendingAction === "delete") result = await api.batchDeleteProjects(ids);
+      if (pendingAction === "delete") await api.batchDeleteProjects(ids);
       if (pendingAction === "start") result = await api.batchStartProjects(ids);
       if (pendingAction === "stop") result = await api.batchStopProjects(ids);
       const failed = result?.failed || [];
