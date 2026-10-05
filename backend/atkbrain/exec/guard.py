@@ -552,8 +552,8 @@ def strict_external_command_reason(
     """Application-level command boundary for the opt-in external mode.
 
     It admits a deliberately small set of non-network utilities or one known
-    connector with literal, parseable exact endpoints.  It is not an OS egress
-    sandbox; the attestation reports that limitation explicitly.
+    connector with literal, parseable exact endpoints. The separate systemd
+    cgroup policy enforces destination addresses; this guard enforces ports.
     """
     if not scope.strict_external:
         return None
